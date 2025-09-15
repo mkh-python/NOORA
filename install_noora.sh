@@ -2,21 +2,20 @@
 set -euo pipefail
 
 # ===============================
-# NOORA – One-Shot Installer
-# Defaults: GitHub=mkh-python/NOORA@main, WS=/cdn-assets-v3, FIRST_USER=user1
-# Prompts only: Domain, Subdomain, CF_TOKEN, BOT_TOKEN, ADMIN_IDS
+# NOORA – One-Shot Installer (Final)
+# - Cloudflare: DNS + Let's Encrypt (DNS-01 via acme.sh)  → بدون نیاز به Origin CA
+# - GitHub source: mkh-python/NOORA@main
+# - Prompts only: Domain, Subdomain, CF_TOKEN, BOT_TOKEN, ADMIN_IDS
 # ===============================
 
 g(){ echo -e "\e[32m$*\e[0m"; }
 y(){ echo -e "\e[33m$*\e[0m"; }
 r(){ echo -e "\e[31m$*\e[0m"; }
-
 require_root(){ if [[ $EUID -ne 0 ]]; then r "Run as root"; exit 1; fi; }
 
 prompt() {
   local var="$1" label="$2" def="${3:-}"
-  local val
-  read -rp "$label ${def:+[$def]}: " val
+  local val; read -rp "$label ${def:+[$def]}: " val
   if [[ -z "${val:-}" && -n "$def" ]]; then val="$def"; fi
   if [[ -z "${val:-}" ]]; then r "Value required for $label"; exit 1; fi
   eval "$var=\"\$val\""
@@ -68,16 +67,21 @@ install_xray() {
   bash <(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)
 }
 
-# -------- Cloudflare (DNS + Origin Cert) --------
+# ===== Cloudflare (DNS) + Let's Encrypt (DNS-01) =====
 setup_cloudflare() {
-  g "[4/9] Configuring Cloudflare for ${FQDN} ..."
+  g "[4/9] Configuring Cloudflare (DNS) + Let's Encrypt for ${FQDN} ..."
+
+  # 4-1) Zone ID
   ZONE_ID=$(curl -fsS -X GET "https://api.cloudflare.com/client/v4/zones?name=${DOMAIN}" \
     -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" \
     | jq -r '.result[0].id')
-  [[ -z "${ZONE_ID}" || "${ZONE_ID}" == "null" ]] && { r "Zone not found in Cloudflare"; exit 1; }
+  if [[ -z "${ZONE_ID}" || "${ZONE_ID}" == "null" ]]; then
+    r "Zone not found via API. Enter Zone ID manually:"
+    read -rp "Zone ID for ${DOMAIN}: " ZONE_ID
+  fi
 
+  # 4-2) Upsert DNS A record (proxied)
   IP=$(curl -fsS ifconfig.me)
-  # Upsert A record proxied
   EXIST_ID=$(curl -fsS -X GET "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?type=A&name=${FQDN}" \
     -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" | jq -r '.result[0].id')
   if [[ -n "${EXIST_ID}" && "${EXIST_ID}" != "null" ]]; then
@@ -89,27 +93,33 @@ setup_cloudflare() {
       -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" \
       --data "{\"type\":\"A\",\"name\":\"${FQDN}\",\"content\":\"${IP}\",\"proxied\":true}" >/dev/null
   fi
+  y "DNS A ${FQDN} → ${IP} (proxied) set."
 
-  # Origin Cert (RSA)
-  g "Requesting Origin Cert..."
-  ORIGIN=$(curl -fsS -X POST "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/origin_ca/certificates" \
-    -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" \
-    --data "{\"hostnames\":[\"${FQDN}\"],\"requested_validity\":5475,\"request_type\":\"origin-rsa\",\"key_size\":2048}")
-  CERT=$(echo "$ORIGIN" | jq -r '.result.certificate')
-  KEY=$(echo "$ORIGIN"  | jq -r '.result.private_key')
-  [[ -z "${CERT}" || -z "${KEY}" || "${CERT}" == "null" ]] && { r "Failed to get Origin cert"; exit 1; }
+  # 4-3) Issue Let's Encrypt cert via acme.sh (DNS-01 with Cloudflare)
+  g "Issuing Let's Encrypt certificate via DNS-01..."
+  if [[ ! -d "$HOME/.acme.sh" ]]; then
+    curl https://get.acme.sh | sh -s email=admin@${DOMAIN}
+  fi
+  "$HOME/.acme.sh/acme.sh" --upgrade --auto-upgrade
+
+  export CF_Token="${CF_TOKEN}"
+  export CF_Zone_ID="${ZONE_ID}"
+
+  "$HOME/.acme.sh/acme.sh" --issue --dns dns_cf -d "${FQDN}" --keylength ec-256
 
   mkdir -p /etc/ssl/certs /etc/ssl/private
-  echo "${CERT}" >/etc/ssl/certs/noora-origin.pem
-  echo "${KEY}"  >/etc/ssl/private/noora-origin.key
-  chmod 600 /etc/ssl/private/noora-origin.key
+  "$HOME/.acme.sh/acme.sh" --install-cert -d "${FQDN}" --ecc \
+    --fullchain-file /etc/ssl/certs/noora-origin.pem \
+    --key-file      /etc/ssl/private/noora-origin.key \
+    --reloadcmd     "systemctl reload nginx"
 
-  y "Tip: In Cloudflare dashboard, set SSL/TLS mode to 'Full (strict)'."
+  chmod 600 /etc/ssl/private/noora-origin.key
+  y "TLS certificate installed at /etc/ssl/certs/noora-origin.pem"
 }
 
 # -------- Xray + Nginx --------
 configure_xray_nginx() {
-  g "[5/9] Configuring Xray + Nginx..."
+  g "[5/9] Configuring Xray + Nginx (pulling files from GitHub)..."
 
   # Base Xray config from repo
   curl -fsSL "${BASE_RAW}/xray/base-config.json" -o /usr/local/etc/xray/config.json
@@ -170,8 +180,9 @@ EOF
 
   # Quick checks
   curl -I "https://${FQDN}/" | head -n 1 || true
-  code=$(curl -sS -o /dev/null -w "%{http_code}" --http1.1 -H "Upgrade: websocket" -H "Connection: Upgrade" "https://${FQDN}${WS_PATH}") || true
-  [[ "$code" != "101" ]] && y "WS 101 not observed yet (DNS/CF may take some seconds)."
+  code=$(curl -sS -o /dev/null -w "%{http_code}" --http1.1 \
+    -H "Upgrade: websocket" -H "Connection: Upgrade" "https://${FQDN}${WS_PATH}") || true
+  [[ "$code" != "101" ]] && y "WS 101 not observed yet (DNS/CF may need ~30–90s)."
 
   echo "${UUID}" >/var/lib/noora-first-user-uuid
 }
@@ -204,7 +215,7 @@ EOF
 
 # -------- Telegram Bot (pull from repo) ----------
 install_bot() {
-  g "[7/9] Installing Telegram Bot..."
+  g "[7/9] Installing Telegram Bot (pulling from GitHub)..."
   mkdir -p /opt/noora-bot
   cd /opt/noora-bot
 
