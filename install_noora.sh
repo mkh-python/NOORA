@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # ===============================
-# NOORA – One-Shot Installer (Final)
-# - Cloudflare: DNS + Let's Encrypt (DNS-01 via acme.sh)  → بدون نیاز به Origin CA
-# - GitHub source: mkh-python/NOORA@main
-# - Prompts only: Domain, Subdomain, CF_TOKEN, BOT_TOKEN, ADMIN_IDS
+# NOORA – One-Shot Installer (No Cloudflare API)
+# Inputs: FQDN, BOT_TOKEN, ADMIN_IDS
+# Defaults: GitHub=mkh-python/NOORA@main, WS=/cdn-assets-v3, FIRST_USER=user1
+# TLS: Try Let's Encrypt (HTTP-01). On failure → Self-Signed (good for CF "Full" mode).
 # ===============================
 
 g(){ echo -e "\e[32m$*\e[0m"; }
@@ -21,7 +21,7 @@ prompt() {
   eval "$var=\"\$val\""
 }
 
-# -------- Defaults (do not ask) --------
+# -------- Defaults --------
 GH_OWNER="mkh-python"
 GH_REPO="NOORA"
 GH_REF="main"
@@ -29,27 +29,28 @@ BASE_RAW="https://raw.githubusercontent.com/${GH_OWNER}/${GH_REPO}/${GH_REF}"
 WS_PATH="/cdn-assets-v3"
 FIRST_USER="user1"
 
-# -------- Inputs (ask only these) ------
+FQDN=""
+BOT_TOKEN=""
+ADMIN_IDS=""
+
+CERT_PATH="/etc/ssl/certs/noora-origin.pem"
+KEY_PATH="/etc/ssl/private/noora-origin.key"
+WEBROOT="/var/www/html"
+
 get_inputs() {
   g "== Inputs =="
-  prompt DOMAIN    "Domain (e.g., vpnmkh.com)"
-  prompt SUBDOMAIN "Subdomain (e.g., nooraws)"
-  prompt CF_TOKEN  "Cloudflare API Token"
+  prompt FQDN "Your FQDN (e.g., nooraws.vpnmkh.com)"
   prompt BOT_TOKEN "Telegram Bot Token"
   prompt ADMIN_IDS "Admin IDs (comma-separated)"
-  FQDN="${SUBDOMAIN}.${DOMAIN}"
-  export DOMAIN SUBDOMAIN FQDN CF_TOKEN BOT_TOKEN ADMIN_IDS WS_PATH FIRST_USER BASE_RAW
 }
 
-# -------- Packages ----------
 install_packages() {
   g "[1/9] Installing packages..."
   apt update
   DEBIAN_FRONTEND=noninteractive apt -y upgrade
-  apt -y install curl unzip nginx python3-venv python3-pip git sqlite3 jq qrencode socat
+  apt -y install curl unzip nginx python3-venv python3-pip git sqlite3 jq qrencode socat openssl
 }
 
-# -------- grpcurl ----------
 install_grpcurl() {
   if ! command -v grpcurl >/dev/null 2>&1; then
     g "[2/9] Installing grpcurl..."
@@ -61,70 +62,77 @@ install_grpcurl() {
   fi
 }
 
-# -------- Xray ------------
 install_xray() {
   g "[3/9] Installing Xray..."
   bash <(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)
 }
 
-# ===== Cloudflare (DNS) + Let's Encrypt (DNS-01) =====
-setup_cloudflare() {
-  g "[4/9] Configuring Cloudflare (DNS) + Let's Encrypt for ${FQDN} ..."
+# TLS: Try Let's Encrypt (HTTP-01) → fallback self-signed
+setup_tls() {
+  g "[4/9] TLS setup for ${FQDN}"
 
-  # 4-1) Zone ID
-  ZONE_ID=$(curl -fsS -X GET "https://api.cloudflare.com/client/v4/zones?name=${DOMAIN}" \
-    -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" \
-    | jq -r '.result[0].id')
-  if [[ -z "${ZONE_ID}" || "${ZONE_ID}" == "null" ]]; then
-    r "Zone not found via API. Enter Zone ID manually:"
-    read -rp "Zone ID for ${DOMAIN}: " ZONE_ID
-  fi
+  # temporary HTTP server block for ACME challenge
+  mkdir -p "${WEBROOT}/.well-known/acme-challenge"
+  cat >/etc/nginx/sites-available/noora-acme.conf <<EOF
+server {
+    listen 80;
+    server_name ${FQDN};
+    location ^~ /.well-known/acme-challenge/ {
+        root ${WEBROOT};
+        default_type "text/plain";
+    }
+    location / { return 200 'OK'; add_header Content-Type text/plain; }
+}
+EOF
+  ln -sf /etc/nginx/sites-available/noora-acme.conf /etc/nginx/sites-enabled/noora-acme.conf
+  rm -f /etc/nginx/sites-enabled/default || true
+  nginx -t && systemctl reload nginx
 
-  # 4-2) Upsert DNS A record (proxied)
-  IP=$(curl -fsS ifconfig.me)
-  EXIST_ID=$(curl -fsS -X GET "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?type=A&name=${FQDN}" \
-    -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" | jq -r '.result[0].id')
-  if [[ -n "${EXIST_ID}" && "${EXIST_ID}" != "null" ]]; then
-    curl -fsS -X PATCH "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/${EXIST_ID}" \
-      -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" \
-      --data "{\"type\":\"A\",\"name\":\"${FQDN}\",\"content\":\"${IP}\",\"proxied\":true}" >/dev/null
-  else
-    curl -fsS -X POST "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records" \
-      -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" \
-      --data "{\"type\":\"A\",\"name\":\"${FQDN}\",\"content\":\"${IP}\",\"proxied\":true}" >/dev/null
-  fi
-  y "DNS A ${FQDN} → ${IP} (proxied) set."
-
-  # 4-3) Issue Let's Encrypt cert via acme.sh (DNS-01 with Cloudflare)
-  g "Issuing Let's Encrypt certificate via DNS-01..."
+  # Try Let's Encrypt via acme.sh (HTTP-01)
+  LE_OK=0
   if [[ ! -d "$HOME/.acme.sh" ]]; then
-    curl https://get.acme.sh | sh -s email=admin@${DOMAIN}
+    curl https://get.acme.sh | sh -s email=admin@${FQDN#*.}
   fi
-  "$HOME/.acme.sh/acme.sh" --upgrade --auto-upgrade
+  "$HOME/.acme.sh/acme.sh" --upgrade --auto-upgrade || true
 
-  export CF_Token="${CF_TOKEN}"
-  export CF_Zone_ID="${ZONE_ID}"
+  set +e
+  "$HOME/.acme.sh/acme.sh" --issue -d "${FQDN}" -w "${WEBROOT}" --keylength ec-256
+  if [[ $? -eq 0 ]]; then
+    mkdir -p "$(dirname "$CERT_PATH")" "$(dirname "$KEY_PATH")"
+    "$HOME/.acme.sh/acme.sh" --install-cert -d "${FQDN}" --ecc \
+      --fullchain-file "${CERT_PATH}" \
+      --key-file      "${KEY_PATH}" \
+      --reloadcmd     "systemctl reload nginx"
+    chmod 600 "${KEY_PATH}"
+    LE_OK=1
+    g "Let's Encrypt certificate installed."
+  else
+    y "Let's Encrypt failed (likely CF orange proxy). Falling back to self-signed..."
+  fi
+  set -e
 
-  "$HOME/.acme.sh/acme.sh" --issue --dns dns_cf -d "${FQDN}" --keylength ec-256
+  if [[ $LE_OK -eq 0 ]]; then
+    mkdir -p "$(dirname "$CERT_PATH")" "$(dirname "$KEY_PATH")"
+    openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+      -keyout "${KEY_PATH}" -out "${CERT_PATH}" -days 825 -subj "/CN=${FQDN}" >/dev/null 2>&1 || \
+    openssl req -x509 -nodes -newkey rsa:2048 \
+      -keyout "${KEY_PATH}" -out "${CERT_PATH}" -days 825 -subj "/CN=${FQDN}" >/dev/null 2>&1
+    chmod 600 "${KEY_PATH}"
+    y "Self-signed cert generated. Tip: In Cloudflare, set SSL/TLS mode to 'Full' (not Strict)."
+  fi
 
-  mkdir -p /etc/ssl/certs /etc/ssl/private
-  "$HOME/.acme.sh/acme.sh" --install-cert -d "${FQDN}" --ecc \
-    --fullchain-file /etc/ssl/certs/noora-origin.pem \
-    --key-file      /etc/ssl/private/noora-origin.key \
-    --reloadcmd     "systemctl reload nginx"
-
-  chmod 600 /etc/ssl/private/noora-origin.key
-  y "TLS certificate installed at /etc/ssl/certs/noora-origin.pem"
+  # remove temp ACME site (we'll create the real site later)
+  rm -f /etc/nginx/sites-enabled/noora-acme.conf /etc/nginx/sites-available/noora-acme.conf
+  nginx -t && systemctl reload nginx || true
 }
 
-# -------- Xray + Nginx --------
 configure_xray_nginx() {
   g "[5/9] Configuring Xray + Nginx (pulling files from GitHub)..."
 
   # Base Xray config from repo
   curl -fsSL "${BASE_RAW}/xray/base-config.json" -o /usr/local/etc/xray/config.json
 
-  # Customize FQDN and WS path
+  # Customize for our FQDN and WS path
   sed -i "s#/cdn-assets-v3#${WS_PATH}#g" /usr/local/etc/xray/config.json
   sed -i "s#example.com#${FQDN}#g"        /usr/local/etc/xray/config.json
 
@@ -142,16 +150,17 @@ for ib in d.get("inbounds",[]):
 open(p,"w").write(json.dumps(d,indent=2,ensure_ascii=False))
 PY
 
-  # Nginx site
+  # Real HTTPS site with WS → Xray
+  echo OK > "${WEBROOT}/index.html"
   cat >/etc/nginx/sites-available/noora.conf <<EOF
 server {
     listen 443 ssl http2;
     server_name ${FQDN};
 
-    ssl_certificate     /etc/ssl/certs/noora-origin.pem;
-    ssl_certificate_key /etc/ssl/private/noora-origin.key;
+    ssl_certificate     ${CERT_PATH};
+    ssl_certificate_key ${KEY_PATH};
 
-    root /var/www/html;
+    root ${WEBROOT};
     index index.html;
 
     add_header X-Frame-Options SAMEORIGIN;
@@ -172,7 +181,6 @@ EOF
 
   ln -sf /etc/nginx/sites-available/noora.conf /etc/nginx/sites-enabled/noora.conf
   rm -f /etc/nginx/sites-enabled/default || true
-  echo OK >/var/www/html/index.html
 
   nginx -t
   systemctl restart nginx
@@ -182,12 +190,11 @@ EOF
   curl -I "https://${FQDN}/" | head -n 1 || true
   code=$(curl -sS -o /dev/null -w "%{http_code}" --http1.1 \
     -H "Upgrade: websocket" -H "Connection: Upgrade" "https://${FQDN}${WS_PATH}") || true
-  [[ "$code" != "101" ]] && y "WS 101 not observed yet (DNS/CF may need ~30–90s)."
+  [[ "$code" != "101" ]] && y "WS 101 not observed yet (CF/DNS may need ~30–90s)."
 
   echo "${UUID}" >/var/lib/noora-first-user-uuid
 }
 
-# -------- Database ----------
 setup_database() {
   g "[6/9] Preparing database..."
   mkdir -p /var/lib/noora /var/lib/noora/backups
@@ -213,7 +220,6 @@ EOF
   sqlite3 /var/lib/noora/noora.db < /var/lib/noora/noora.db.sql
 }
 
-# -------- Telegram Bot (pull from repo) ----------
 install_bot() {
   g "[7/9] Installing Telegram Bot (pulling from GitHub)..."
   mkdir -p /opt/noora-bot
@@ -253,7 +259,6 @@ EOF
   systemctl status noora-bot --no-pager || true
 }
 
-# -------- Firewall (optional) ----------
 setup_firewall() {
   g "[8/9] Firewall (optional)"
   if command -v ufw >/dev/null 2>&1; then
@@ -264,7 +269,6 @@ setup_firewall() {
   fi
 }
 
-# -------- Finish -----------
 finish() {
   g "[9/9] Done."
   UUID=$(cat /var/lib/noora-first-user-uuid)
@@ -272,7 +276,7 @@ finish() {
   g "First user's link:"
   echo "${LINK}"
   qrencode -t ANSIUTF8 "${LINK}" || true
-  y "If Cloudflare DNS just changed, give it ~30–90s for WS 101."
+  y "If CF proxy just toggled, give it ~30–90s. For self-signed, set Cloudflare SSL/TLS to 'Full' (not Strict)."
 }
 
 main() {
@@ -281,7 +285,7 @@ main() {
   install_packages
   install_grpcurl
   install_xray
-  setup_cloudflare
+  setup_tls
   configure_xray_nginx
   setup_database
   install_bot
