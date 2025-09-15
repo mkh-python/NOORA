@@ -1,52 +1,48 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ============ رنگ لاگ ============
+# ===============================
+# NOORA – One-Shot Installer
+# Defaults: GitHub=mkh-python/NOORA@main, WS=/cdn-assets-v3, FIRST_USER=user1
+# Prompts only: Domain, Subdomain, CF_TOKEN, BOT_TOKEN, ADMIN_IDS
+# ===============================
+
 g(){ echo -e "\e[32m$*\e[0m"; }
 y(){ echo -e "\e[33m$*\e[0m"; }
 r(){ echo -e "\e[31m$*\e[0m"; }
 
-require_root() {
-  if [[ $EUID -ne 0 ]]; then r "Run as root"; exit 1; fi
-}
+require_root(){ if [[ $EUID -ne 0 ]]; then r "Run as root"; exit 1; fi; }
 
 prompt() {
-  local var="$1" msg="$2" def="${3:-}"
+  local var="$1" label="$2" def="${3:-}"
   local val
-  read -rp "$msg ${def:+[$def]}: " val
+  read -rp "$label ${def:+[$def]}: " val
   if [[ -z "${val:-}" && -n "$def" ]]; then val="$def"; fi
-  if [[ -z "${val:-}" ]]; then r "Value required"; exit 1; fi
+  if [[ -z "${val:-}" ]]; then r "Value required for $label"; exit 1; fi
   eval "$var=\"\$val\""
 }
 
-# ============ ورودی‌ها ============
+# -------- Defaults (do not ask) --------
+GH_OWNER="mkh-python"
+GH_REPO="NOORA"
+GH_REF="main"
+BASE_RAW="https://raw.githubusercontent.com/${GH_OWNER}/${GH_REPO}/${GH_REF}"
+WS_PATH="/cdn-assets-v3"
+FIRST_USER="user1"
+
+# -------- Inputs (ask only these) ------
 get_inputs() {
   g "== Inputs =="
-
-  # GitHub raw access info
-  prompt GH_OWNER "GitHub owner/org (e.g., your-username)"
-  prompt GH_REPO  "GitHub repo name (e.g., noora-vpn)"
-  prompt GH_REF   "Git ref (branch/tag/commit, e.g., main)" "main"
-  BASE_RAW="https://raw.githubusercontent.com/${GH_OWNER}/${GH_REPO}/${GH_REF}"
-
-  # Domain & CF
   prompt DOMAIN    "Domain (e.g., vpnmkh.com)"
-  prompt SUBDOMAIN "Subdomain (e.g., noora1)"
+  prompt SUBDOMAIN "Subdomain (e.g., nooraws)"
   prompt CF_TOKEN  "Cloudflare API Token"
-  FQDN="${SUBDOMAIN}.${DOMAIN}"
-
-  # Bot
   prompt BOT_TOKEN "Telegram Bot Token"
   prompt ADMIN_IDS "Admin IDs (comma-separated)"
-  prompt WS_PATH   "WS path" "/cdn-assets-v3"
-
-  # First user (optional quick test)
-  prompt FIRST_USER "First user name (e.g., user1)" "user1"
-
-  export BASE_RAW FQDN WS_PATH BOT_TOKEN ADMIN_IDS DOMAIN SUBDOMAIN CF_TOKEN FIRST_USER
+  FQDN="${SUBDOMAIN}.${DOMAIN}"
+  export DOMAIN SUBDOMAIN FQDN CF_TOKEN BOT_TOKEN ADMIN_IDS WS_PATH FIRST_USER BASE_RAW
 }
 
-# ============ نصب پکیج‌ها ============
+# -------- Packages ----------
 install_packages() {
   g "[1/9] Installing packages..."
   apt update
@@ -54,84 +50,76 @@ install_packages() {
   apt -y install curl unzip nginx python3-venv python3-pip git sqlite3 jq qrencode socat
 }
 
-# ============ نصب grpcurl ============
+# -------- grpcurl ----------
 install_grpcurl() {
   if ! command -v grpcurl >/dev/null 2>&1; then
     g "[2/9] Installing grpcurl..."
-    curl -L https://github.com/fullstorydev/grpcurl/releases/download/v1.9.1/grpcurl_1.9.1_linux_x86_64.tar.gz \
+    curl -fsSL https://github.com/fullstorydev/grpcurl/releases/download/v1.9.1/grpcurl_1.9.1_linux_x86_64.tar.gz \
       | tar -xz -C /usr/local/bin grpcurl
     chmod +x /usr/local/bin/grpcurl
   else
-    y "grpcurl already installed."
+    y "grpcurl already present."
   fi
 }
 
-# ============ نصب Xray ============
+# -------- Xray ------------
 install_xray() {
   g "[3/9] Installing Xray..."
-  bash <(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)
+  bash <(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)
 }
 
-# ============ Cloudflare: DNS + Origin Cert + SSL Mode + Rule ============
+# -------- Cloudflare (DNS + Origin Cert) --------
 setup_cloudflare() {
   g "[4/9] Configuring Cloudflare for ${FQDN} ..."
-  ZONE_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=${DOMAIN}" \
+  ZONE_ID=$(curl -fsS -X GET "https://api.cloudflare.com/client/v4/zones?name=${DOMAIN}" \
     -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" \
     | jq -r '.result[0].id')
+  [[ -z "${ZONE_ID}" || "${ZONE_ID}" == "null" ]] && { r "Zone not found in Cloudflare"; exit 1; }
 
-  if [[ -z "${ZONE_ID}" || "${ZONE_ID}" == "null" ]]; then
-    r "Zone not found. Ensure domain is in your Cloudflare account."
-    exit 1
-  fi
-
-  IP=$(curl -s ifconfig.me)
-  # Upsert DNS A record (proxied)
-  EXIST_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?type=A&name=${FQDN}" \
+  IP=$(curl -fsS ifconfig.me)
+  # Upsert A record proxied
+  EXIST_ID=$(curl -fsS -X GET "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?type=A&name=${FQDN}" \
     -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" | jq -r '.result[0].id')
   if [[ -n "${EXIST_ID}" && "${EXIST_ID}" != "null" ]]; then
-    curl -s -X PATCH "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/${EXIST_ID}" \
+    curl -fsS -X PATCH "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/${EXIST_ID}" \
       -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" \
       --data "{\"type\":\"A\",\"name\":\"${FQDN}\",\"content\":\"${IP}\",\"proxied\":true}" >/dev/null
   else
-    curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records" \
+    curl -fsS -X POST "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records" \
       -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" \
       --data "{\"type\":\"A\",\"name\":\"${FQDN}\",\"content\":\"${IP}\",\"proxied\":true}" >/dev/null
   fi
 
-  # Create Origin Certificate
+  # Origin Cert (RSA)
   g "Requesting Origin Cert..."
-  ORIGIN=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/origin_ca/certificates" \
+  ORIGIN=$(curl -fsS -X POST "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/origin_ca/certificates" \
     -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" \
     --data "{\"hostnames\":[\"${FQDN}\"],\"requested_validity\":5475,\"request_type\":\"origin-rsa\",\"key_size\":2048}")
   CERT=$(echo "$ORIGIN" | jq -r '.result.certificate')
   KEY=$(echo "$ORIGIN"  | jq -r '.result.private_key')
+  [[ -z "${CERT}" || -z "${KEY}" || "${CERT}" == "null" ]] && { r "Failed to get Origin cert"; exit 1; }
 
   mkdir -p /etc/ssl/certs /etc/ssl/private
   echo "${CERT}" >/etc/ssl/certs/noora-origin.pem
   echo "${KEY}"  >/etc/ssl/private/noora-origin.key
   chmod 600 /etc/ssl/private/noora-origin.key
 
-  # (Optional) SSL mode Full(strict) – Cloudflare API v4 for settings is broader; many accounts default ok.
-  y "Remember to set Cloudflare SSL/TLS mode to 'Full (strict)' for ${DOMAIN}."
-
-  # (Optional) Add rule for WS path to bypass cache & challenges (can vary per account plan)
-  y "Consider adding a Page/Cache rule in Cloudflare to bypass cache for ${FQDN}${WS_PATH}*"
+  y "Tip: In Cloudflare dashboard, set SSL/TLS mode to 'Full (strict)'."
 }
 
-# ============ کانفیگ Xray + Nginx (با استفاده از فایل‌های GitHub) ============
+# -------- Xray + Nginx --------
 configure_xray_nginx() {
   g "[5/9] Configuring Xray + Nginx..."
 
-  # Fetch base Xray config
+  # Base Xray config from repo
   curl -fsSL "${BASE_RAW}/xray/base-config.json" -o /usr/local/etc/xray/config.json
 
-  # Customize config with FQDN & WS_PATH
+  # Customize FQDN and WS path
   sed -i "s#/cdn-assets-v3#${WS_PATH}#g" /usr/local/etc/xray/config.json
   sed -i "s#example.com#${FQDN}#g"        /usr/local/etc/xray/config.json
 
-  # Add first user (one UUID)
+  # Add first client
   UUID=$(cat /proc/sys/kernel/random/uuid)
-  # Inject first client into config.json clients array
   python3 - <<PY
 import json
 p="/usr/local/etc/xray/config.json"
@@ -174,23 +162,21 @@ EOF
 
   ln -sf /etc/nginx/sites-available/noora.conf /etc/nginx/sites-enabled/noora.conf
   rm -f /etc/nginx/sites-enabled/default || true
-  echo OK > /var/www/html/index.html
+  echo OK >/var/www/html/index.html
 
   nginx -t
   systemctl restart nginx
   systemctl restart xray
 
-  # Quick front test
-  curl -I "https://${FQDN}/" | head -n 1
-  # Quick WS (expect 101)
+  # Quick checks
+  curl -I "https://${FQDN}/" | head -n 1 || true
   code=$(curl -sS -o /dev/null -w "%{http_code}" --http1.1 -H "Upgrade: websocket" -H "Connection: Upgrade" "https://${FQDN}${WS_PATH}") || true
-  if [[ "$code" != "101" ]]; then y "WS 101 not observed yet (CF DNS may need a minute)."; fi
+  [[ "$code" != "101" ]] && y "WS 101 not observed yet (DNS/CF may take some seconds)."
 
-  # Save UUID for output
   echo "${UUID}" >/var/lib/noora-first-user-uuid
 }
 
-# ============ DB ============
+# -------- Database ----------
 setup_database() {
   g "[6/9] Preparing database..."
   mkdir -p /var/lib/noora /var/lib/noora/backups
@@ -216,10 +202,9 @@ EOF
   sqlite3 /var/lib/noora/noora.db < /var/lib/noora/noora.db.sql
 }
 
-# ============ نصب ربات تلگرام از GitHub ============
+# -------- Telegram Bot (pull from repo) ----------
 install_bot() {
   g "[7/9] Installing Telegram Bot..."
-
   mkdir -p /opt/noora-bot
   cd /opt/noora-bot
 
@@ -227,7 +212,7 @@ install_bot() {
   curl -fsSL "${BASE_RAW}/bot/bot.py"          -o bot.py
   curl -fsSL "${BASE_RAW}/bot/.env.example"    -o .env
 
-  # Fill .env from prompts
+  # Fill env
   sed -i "s#YOUR_TELEGRAM_BOT_TOKEN#${BOT_TOKEN}#g" .env
   sed -i "s#123456789,987654321#${ADMIN_IDS}#g"     .env
   sed -i "s#noora1.vpnmkh.com#${FQDN}#g"            .env
@@ -238,7 +223,7 @@ install_bot() {
   pip install --upgrade pip
   pip install -r requirements.txt
 
-  # systemd service
+  # Systemd service
   cat >/etc/systemd/system/noora-bot.service <<EOF
 [Unit]
 Description=Noora VPN Telegram Bot
@@ -257,9 +242,9 @@ EOF
   systemctl status noora-bot --no-pager || true
 }
 
-# ============ فایروال (اختیاری) ============
+# -------- Firewall (optional) ----------
 setup_firewall() {
-  g "[8/9] Firewall (optional)..."
+  g "[8/9] Firewall (optional)"
   if command -v ufw >/dev/null 2>&1; then
     ufw allow OpenSSH || true
     ufw allow 80/tcp || true
@@ -268,7 +253,7 @@ setup_firewall() {
   fi
 }
 
-# ============ خروجی نهایی ============
+# -------- Finish -----------
 finish() {
   g "[9/9] Done."
   UUID=$(cat /var/lib/noora-first-user-uuid)
@@ -276,7 +261,7 @@ finish() {
   g "First user's link:"
   echo "${LINK}"
   qrencode -t ANSIUTF8 "${LINK}" || true
-  y "If CF just changed DNS, give it a minute for WS 101 to appear."
+  y "If Cloudflare DNS just changed, give it ~30–90s for WS 101."
 }
 
 main() {
